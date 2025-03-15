@@ -1,9 +1,7 @@
 import pandas as pd
-import numpy as np
 import time
 import random
 import math
-import re
 import argparse
 import copy
 
@@ -244,13 +242,13 @@ def normalize_room_name(room_name):
 
 
 def calculate_energy(solution, course_code_to_row, room_name_to_row, course_to_index, room_to_index,
-                     index_to_course, index_to_room, course_students, utilization_weight=1.0, conflict_weight=100000):
+                     index_to_course, index_to_room, course_students, utilization_weight=1.0, conflict_weight=100.0):
     """
     计算解的能量值：
       - 硬约束（同一时间同一教室只能安排一门课、教室容量不足、课程每周只安排一次等）受到高惩罚；
       - 软约束包括：鼓励高教室利用率以及惩罚学生课程冲突（同一时间安排了某学生选的多门课）。
 
-    更新：支持不同时长的课程。
+    更新：支持不同时长的课程，并将学生冲突改为软约束。
     """
     energy = 0
     hard_constraint_weight = 1000
@@ -357,10 +355,31 @@ def calculate_energy(solution, course_code_to_row, room_name_to_row, course_to_i
         if not course_code:
             continue
 
+        # 获取课程的学期和周信息
+        course_row = course_code_to_row.get(course_idx)
+        if not course_row:
+            continue
+
+        semester_str = course_row.get('Delivery Semester', 'Unknown')
+        week, day = convert_weekday_to_week_and_day(weekday_idx)
+
+        # 标准化学期信息
+        if isinstance(semester_str, str):
+            semester_str = semester_str.lower()
+            if 'semester1' in semester_str or 'semester 1' in semester_str:
+                semester = "Semester1"
+            elif 'semester2' in semester_str or 'semester 2' in semester_str:
+                semester = "Semester2"
+            else:
+                semester = semester_str
+        else:
+            semester = "Unknown"
+
         # 对课程占用的每个时间槽进行检查
         for slot_offset in range(duration_slots):
             curr_slot = time_slot + slot_offset
-            time_key = (weekday_idx, curr_slot)
+            # 使用四元组作为键：(学期, 周, 日, 时间槽)，确保只在相同语境下比较课程
+            time_key = (semester, week, day, curr_slot)
 
             if time_key not in time_slot_courses:
                 time_slot_courses[time_key] = []
@@ -381,13 +400,11 @@ def calculate_energy(solution, course_code_to_row, room_name_to_row, course_to_i
                     common_students = len(s1.intersection(s2))
                     conflict_count += common_students
 
-    # 如果存在任何冲突，则直接加上一个巨大的惩罚
-    LARGE_PENALTY = 10 ** 100  # 根据需要调整这个值
-    if conflict_count > 0:
-        energy += LARGE_PENALTY
+    # 修改：将学生冲突改为软约束，惩罚与冲突数量成比例
+    # 使用更合理的权重，默认值从50000降低到100
+    energy += conflict_count * conflict_weight
 
     return energy
-
 
 def generate_initial_solution_with_activities(regular_course_indices, index_to_course_row,
                                               rooms_df, room_to_index, blocked_slots):
@@ -471,7 +488,6 @@ def generate_initial_solution_with_activities(regular_course_indices, index_to_c
                     f"警告: 无法为课程 {course_row['Course Code']} ({activity_type}) 在第{week}周找到合适的时间和教室")
 
     return solution
-
 
 def generate_neighbor_with_activities(solution, regular_course_indices, index_to_course_row,
                                       rooms_df, room_to_index, index_to_course,
@@ -820,8 +836,9 @@ def convert_solution_to_schedule_with_activities(solution, all_courses_df, rooms
         end_time_slot = time_slot + duration_slots - 1
         end_time = convert_slot_to_time(end_time_slot)
 
-        # 为每个被合并的workshop创建记录
-        if merged_details:
+        # 类型检查，确保merged_details是可迭代对象
+        if isinstance(merged_details, list) and merged_details:
+            # 为每个被合并的workshop创建记录
             for detail in merged_details:
                 workshop_id = detail.get('ID', 'Unknown')
                 workshop_size = detail.get('Real Size', 0)
@@ -849,6 +866,7 @@ def convert_solution_to_schedule_with_activities(solution, all_courses_df, rooms
                 })
         else:
             # 如果没有详细信息，创建一条记录
+            print(f"警告: merged_details不是列表类型或为空，类型为{type(merged_details)}")
             schedule.append({
                 'Course Code': course_code,
                 'Course Name': course_row.get('Course Name', ''),
@@ -870,7 +888,8 @@ def convert_solution_to_schedule_with_activities(solution, all_courses_df, rooms
                 'Merged Count': course_row.get('Merged_Count', 0)
             })
 
-            return pd.DataFrame(schedule)
+    # 将return语句移到函数最外层
+    return pd.DataFrame(schedule)
 
 def compute_student_conflict_with_activities(schedule_df, course_students):
     """
@@ -930,7 +949,8 @@ def compute_student_conflict_with_activities(schedule_df, course_students):
             # 按时间槽分组存储课程
             time_slot_courses = {}
             for course in courses_list:
-                slot = course['Time Slot']
+                # 修改这里：使用'Start Time Slot'而不是'Time Slot'
+                slot = course['Start Time Slot']
                 if slot not in time_slot_courses:
                     time_slot_courses[slot] = []
                 time_slot_courses[slot].append(course)
@@ -1016,7 +1036,6 @@ def compute_student_conflict_with_activities(schedule_df, course_students):
     print(f"课程冲突率: {conflict_rate:.2f}%")
 
     return total_conflict_courses, conflict_rate, len(conflict_students), len(total_students)
-
 
 def simulated_annealing_scheduling(
         enrollment_file='math_student_enrollment.xlsx',
@@ -1350,11 +1369,11 @@ if __name__ == "__main__":
         enrollment_file=args.enrollment_file,
         courses_file=args.courses_file,
         rooms_file=args.rooms_file,
-        max_iterations=args.max_iterations,
-        initial_temperature=args.initial_temperature,
-        cooling_rate=args.cooling_rate,
-        utilization_weight=args.utilization_weight,
-        conflict_weight=args.conflict_weight
+        max_iterations=300000,  # 增加迭代次数
+        initial_temperature=5000,  # 提高初始温度
+        cooling_rate=0.9995,  # 更慢的冷却速率
+        utilization_weight=1.0,  # 保持教室利用率权重
+        conflict_weight=100.0  # 显著降低冲突权重，使其成为真正的软约束
     )
 
     conflict_count, conflict_rate, num_conflict_students, total_students = compute_student_conflict_with_activities(
