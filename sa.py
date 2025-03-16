@@ -61,7 +61,9 @@ def parse_duration(duration_str):
         if ':' in duration_str:
             hours, minutes = map(int, duration_str.split(':'))
             # 计算总分钟数，然后除以30分钟得到时间槽数
-            return math.ceil((hours * 60 + minutes) / 30)
+            slots = (hours * 60 + minutes) / 30
+            # 确保返回整数时间槽
+            return int(round(slots))
 
         # 也可能是纯数字表示小时
         elif duration_str.isdigit():
@@ -212,7 +214,7 @@ def convert_slot_to_time(time_slot):
     """
     将时间段索引(1-18)转换为时间字符串，如'09:00'
     """
-    if not isinstance(time_slot, int) or time_slot < 1 or time_slot > 18:
+    if not isinstance(time_slot, int) or time_slot < 1 or time_slot > 19:
         return None
     hour = 9 + ((time_slot - 1) // 2)
     minute = 30 if (time_slot - 1) % 2 == 1 else 0
@@ -239,7 +241,6 @@ def normalize_room_name(room_name):
     normalized = " ".join(normalized.split())
 
     return normalized
-
 
 def calculate_energy(solution, course_code_to_row, room_name_to_row, course_to_index, room_to_index,
                      index_to_course, index_to_room, course_students, utilization_weight=1.0, conflict_weight=100.0):
@@ -307,16 +308,22 @@ def calculate_energy(solution, course_code_to_row, room_name_to_row, course_to_i
             energy += (count - 1) * hard_constraint_weight
 
     # 约束5：确保长课程不会跨越午休时间或一天结束
-    # 假设午休时间为12:00-13:30（对应时间槽7-9）
-    # 假设一天的结束时间为18:00（对应时间槽18）
+    # 午休时间为12:00-13:30（对应时间槽7-9）
     for (course_idx, weekday_idx, time_slot), (room_idx, duration_slots) in solution.items():
         # 检查是否跨越午休
-        if time_slot <= 6 and time_slot + duration_slots > 6:
-            energy += hard_constraint_weight  # 跨越午休，添加惩罚
+        if (time_slot <= 6 and time_slot + duration_slots > 6) or (time_slot <= 9 and time_slot + duration_slots > 9):
+            energy += hard_constraint_weight * 2  # 跨越午休，添加更高惩罚
 
         # 检查是否超出一天时间范围
         if time_slot + duration_slots > 19:
             energy += hard_constraint_weight  # 超出时间范围，添加惩罚
+
+        # 约束6（新增）：确保课程持续时间与原始数据一致
+        course_row = course_code_to_row.get(course_idx)
+        if course_row is not None:
+            expected_duration = parse_duration(course_row.get('Duration', '1:00'))
+            if duration_slots != expected_duration:
+                energy += hard_constraint_weight * 5  # 持续时间不一致，添加高惩罚
 
     # 软约束1：教室利用率（使用传入的权重）
     total_utilization = 0
@@ -421,7 +428,11 @@ def generate_initial_solution_with_activities(regular_course_indices, index_to_c
         teaching_weeks = course_row['Teaching_Weeks']
 
         # 获取课程持续时间
-        duration_slots = parse_duration(course_row.get('Duration', '1:00'))
+        original_duration = course_row.get('Duration', '1:00')
+        duration_slots = parse_duration(original_duration)
+
+        # 记录原始持续时间和解析后的槽数，以便调试
+        print(f"课程 {course_row['Course Code']} 原始持续时间: {original_duration}, 解析为 {duration_slots} 个时间槽")
 
         # 筛选容量足够的教室
         suitable_rooms = []
@@ -442,11 +453,20 @@ def generate_initial_solution_with_activities(regular_course_indices, index_to_c
 
             for _ in range(max_attempts):
                 day = random.randint(1, 5)
-                # 确保长课程不会超出一天的时间范围
-                max_start_slot = 19 - duration_slots  # 假设一天最多18个时间槽
-                if max_start_slot < 1:
-                    max_start_slot = 1  # 至少从第一个时间槽开始
-                time_slot = random.randint(1, max_start_slot)
+                # 确保长课程不会超出一天的时间范围或跨越午休时间
+                valid_start_slots = []
+                for potential_start in range(1, 19 - duration_slots + 1):
+                    # 检查是否跨越午休时间 (假设午休时间为12:00-13:30，对应时间槽7-9)
+                    if potential_start <= 6 and potential_start + duration_slots > 6:
+                        continue
+                    if potential_start <= 9 and potential_start + duration_slots > 9:
+                        continue
+                    valid_start_slots.append(potential_start)
+
+                if not valid_start_slots:
+                    continue  # 没有有效的开始时间，尝试下一次循环
+
+                time_slot = random.choice(valid_start_slots)
                 weekday_idx = 5 * (week - 1) + day
 
                 # 检查该课程占用的所有时间槽是否都没有被阻塞
@@ -488,6 +508,7 @@ def generate_initial_solution_with_activities(regular_course_indices, index_to_c
                     f"警告: 无法为课程 {course_row['Course Code']} ({activity_type}) 在第{week}周找到合适的时间和教室")
 
     return solution
+
 
 def generate_neighbor_with_activities(solution, regular_course_indices, index_to_course_row,
                                       rooms_df, room_to_index, index_to_course,
@@ -557,13 +578,24 @@ def generate_neighbor_with_activities(solution, regular_course_indices, index_to
             current_blocked_slots[block_key].remove(room_idx)
 
     if operation in (1, 3):  # 改变时间 或 同时改变时间和教室
-        # 生成新的时间
+        # 生成新的时间，但确保不会跨越午休时间
         new_day = random.randint(1, 5)
-        # 确保长课程不会超出一天的时间范围
-        max_start_slot = 19 - duration_slots
-        if max_start_slot < 1:
-            max_start_slot = 1
-        new_time_slot = random.randint(1, max_start_slot)
+
+        # 找出所有有效的开始时间槽
+        valid_start_slots = []
+        for potential_start in range(1, 19 - duration_slots + 1):
+            # 检查是否跨越午休时间 (假设午休时间为12:00-13:30，对应时间槽7-9)
+            if potential_start <= 6 and potential_start + duration_slots > 6:
+                continue
+            if potential_start <= 9 and potential_start + duration_slots > 9:
+                continue
+            valid_start_slots.append(potential_start)
+
+        if not valid_start_slots:
+            # 没有有效的开始时间，返回原始解
+            return new_solution
+
+        new_time_slot = random.choice(valid_start_slots)
         new_weekday_idx = 5 * (week - 1) + new_day
 
         # 检查新时间槽是否所有都可用（对于操作1，仍使用当前教室）
@@ -749,12 +781,13 @@ def identify_conflict_courses_with_activities(solution, course_students, index_t
     # 如果需要，可以同时返回冲突课程索引集合以保持兼容性
     return valid_conflict_keys, conflict_course_indices
 
+
 def convert_solution_to_schedule_with_activities(solution, all_courses_df, rooms_df,
                                                  index_to_course, index_to_room, index_to_course_row):
     """
     将解转换为排课表格式，支持不同活动类型和合并的workshop。
     对于合并的workshop，会展开为多条记录，每条记录使用相同的时间和教室。
-    考虑课程的持续时间。
+    考虑课程的持续时间，并确保结束时间正确。
     """
     schedule = []
 
@@ -789,8 +822,8 @@ def convert_solution_to_schedule_with_activities(solution, all_courses_df, rooms
         # 获取活动类型
         activity_type = course_row.get('Activity Type Name', 'Unknown')
 
-        # 计算结束时间
-        end_time_slot = time_slot + duration_slots - 1
+        # 计算结束时间 - 修正结束时间计算，确保与课程持续时间一致
+        end_time_slot = time_slot + duration_slots
         end_time = convert_slot_to_time(end_time_slot)
 
         # 添加课程安排
@@ -809,6 +842,7 @@ def convert_solution_to_schedule_with_activities(solution, all_courses_df, rooms
             'End Time Slot': end_time_slot,
             'End Time': end_time,
             'Duration Slots': duration_slots,
+            'Duration': course_row.get('Duration', '1:00'),  # 保存原始持续时间
             'Class Size': course_row['Real Size'],
             'Is Large Course': course_row.get('Real Size', 0) > course_row.get('Planned Size', 0),
             'Is Merged Workshop': False
@@ -832,8 +866,8 @@ def convert_solution_to_schedule_with_activities(solution, all_courses_df, rooms
         activity_type = course_row.get('Activity Type Name', 'Unknown')
         merged_details = course_row.get('Merged_Details', [])
 
-        # 计算结束时间
-        end_time_slot = time_slot + duration_slots - 1
+        # 计算结束时间 - 修正结束时间计算
+        end_time_slot = time_slot + duration_slots
         end_time = convert_slot_to_time(end_time_slot)
 
         # 类型检查，确保merged_details是可迭代对象
@@ -858,6 +892,7 @@ def convert_solution_to_schedule_with_activities(solution, all_courses_df, rooms
                     'End Time Slot': end_time_slot,
                     'End Time': end_time,
                     'Duration Slots': duration_slots,
+                    'Duration': course_row.get('Duration', '1:00'),  # 保存原始持续时间
                     'Class Size': workshop_size,  # 使用原始workshop的人数
                     'Total Merged Size': course_row['Real Size'],  # 合并后的总人数
                     'Is Large Course': course_row.get('Real Size', 0) > course_row.get('Planned Size', 0),
@@ -882,6 +917,7 @@ def convert_solution_to_schedule_with_activities(solution, all_courses_df, rooms
                 'End Time Slot': end_time_slot,
                 'End Time': end_time,
                 'Duration Slots': duration_slots,
+                'Duration': course_row.get('Duration', '1:00'),  # 保存原始持续时间
                 'Class Size': course_row['Real Size'],
                 'Is Large Course': course_row.get('Real Size', 0) > course_row.get('Planned Size', 0),
                 'Is Merged Workshop': True,
@@ -1037,6 +1073,7 @@ def compute_student_conflict_with_activities(schedule_df, course_students):
 
     return total_conflict_courses, conflict_rate, len(conflict_students), len(total_students)
 
+
 def simulated_annealing_scheduling(
         enrollment_file='math_student_enrollment.xlsx',
         courses_file='df_final_cleaned_1.xlsx',
@@ -1052,7 +1089,8 @@ def simulated_annealing_scheduling(
       1. 大课程定义为：Real Size > Planned Size，这些课程强制安排在其指定教室；
       2. 处理不同活动类型（lecture, workshop等），相同course code的不同活动单独排课；
       3. 合并符合条件的workshop（相同course code、教学周模式、活动类型），合并后不超过120人；
-      4. 输出中会展开合并的workshop，确保被合并的workshop使用相同的时间和教室。
+      4. 输出中会展开合并的workshop，确保被合并的workshop使用相同的时间和教室；
+      5. 确保课程的持续时间与原始数据一致，不会被分割成多个小时间段。
     """
     try:
         courses_df = pd.read_excel(courses_file)
@@ -1073,6 +1111,13 @@ def simulated_annealing_scheduling(
         # 在课程数据中创建标准化的教室名称
         courses_df['Normalized_Room_Name'] = courses_df['ROOM NAME'].apply(normalize_room_name)
 
+        # 显示课程持续时间的统计
+        print("\n---------- 课程持续时间统计 ----------")
+        duration_counts = courses_df['Duration'].value_counts()
+        for duration, count in duration_counts.items():
+            slots = parse_duration(duration)
+            print(f"持续时间 {duration} ({slots} 个时间槽): {count} 个课程")
+
         # 预处理课程数据，包括处理不同活动类型和合并workshop
         processed_courses_df = preprocess_course_with_activities(courses_df)
 
@@ -1084,6 +1129,7 @@ def simulated_annealing_scheduling(
 
         all_courses_df = processed_courses_df.copy()  # 保存所有课程数据用于最终能量计算
 
+        print("\n---------- 课程与教室统计 ----------")
         print("处理后课程总数: {}".format(len(processed_courses_df)))
         print("大课程数量: {}".format(len(large_course_df)))
         print("常规课程数量: {}".format(len(regular_courses_df)))
@@ -1177,7 +1223,10 @@ def simulated_annealing_scheduling(
         normalized_room_name = course_row['Normalized_Room_Name']
 
         # 获取课程持续时间
-        duration_slots = parse_duration(course_row.get('Duration', '1:00'))
+        duration = course_row.get('Duration', '1:00')
+        duration_slots = parse_duration(duration)
+
+        print(f"大课程 {unique_id} 持续时间: {duration} ({duration_slots} 个时间槽)")
 
         # 使用标准化后的教室名称查找匹配
         if normalized_room_name in room_name_map:
@@ -1212,15 +1261,37 @@ def simulated_annealing_scheduling(
         # 为每个教学周安排一个时间
         teaching_weeks = course_row['Teaching_Weeks']
         for week in teaching_weeks:
-            day = random.randint(1, 5)
-            # 确保长课程不会超出一天的时间范围
-            max_start_slot = 19 - duration_slots
-            if max_start_slot < 1:
-                max_start_slot = 1
-            time_slot = random.randint(1, max_start_slot)
-            weekday_idx = 5 * (week - 1) + day
-            # 使用元组(room_idx, duration_slots)而不是单个整数
-            large_courses_solution[(idx_val, weekday_idx, time_slot)] = (designated_room_idx, duration_slots)
+            # 尝试多次寻找合适的时间
+            max_attempts = 30
+            success = False
+
+            for _ in range(max_attempts):
+                day = random.randint(1, 5)
+
+                # 找出所有有效的开始时间槽（避开午休时间）
+                valid_start_slots = []
+                for potential_start in range(1, 19 - duration_slots + 1):
+                    # 检查是否跨越午休时间
+                    if potential_start <= 6 and potential_start + duration_slots > 6:
+                        continue
+                    if potential_start <= 9 and potential_start + duration_slots > 9:
+                        continue
+                    valid_start_slots.append(potential_start)
+
+                if not valid_start_slots:
+                    print(f"  警告: 无法为大课程 {unique_id} 找到有效的开始时间（持续时间: {duration_slots} 个时间槽)")
+                    continue
+
+                time_slot = random.choice(valid_start_slots)
+                weekday_idx = 5 * (week - 1) + day
+
+                # 使用元组(room_idx, duration_slots)而不是单个整数
+                large_courses_solution[(idx_val, weekday_idx, time_slot)] = (designated_room_idx, duration_slots)
+                success = True
+                break
+
+            if not success:
+                print(f"  警告: 无法为大课程 {unique_id} 在第 {week} 周找到合适的时间（尝试 {max_attempts} 次）")
 
     # 构造blocked_slots：记录每个(weekday_idx, time_slot)内已被大课程占用的教室
     blocked_slots = {}
@@ -1234,7 +1305,7 @@ def simulated_annealing_scheduling(
             blocked_slots[key].add(room_idx)
 
     # --- 处理常规课程 ---
-    print("生成常规课程初始解...")
+    print("\n生成常规课程初始解...")
     current_solution = generate_initial_solution_with_activities(regular_course_indices, index_to_course_row,
                                                                  rooms_df, room_to_index, blocked_slots)
 
@@ -1266,7 +1337,7 @@ def simulated_annealing_scheduling(
     iteration = 0
     no_improvement = 0
 
-    print("开始模拟退火...")
+    print("\n开始模拟退火...")
     start_time = time.time()
 
     while iteration < max_iterations and temperature > 0.1 and no_improvement < 10000:
@@ -1316,7 +1387,7 @@ def simulated_annealing_scheduling(
                 iteration, temperature, current_energy, best_energy, elapsed_time))
 
     # --- 生成结果 ---
-    print("模拟退火完成，总迭代次数: {}, 最终温度: {:.2f}".format(iteration, temperature))
+    print("\n模拟退火完成，总迭代次数: {}, 最终温度: {:.2f}".format(iteration, temperature))
     print("最佳解能量值: {}".format(best_energy))
 
     # 使用修改后的函数生成课表，支持活动类型和合并workshop
@@ -1333,8 +1404,36 @@ def simulated_annealing_scheduling(
     schedule_df['使用率'] = (schedule_df['Class Size'] / schedule_df['Room Capacity'] * 100).round(2)
     avg_utilization = schedule_df['使用率'].mean()
 
-    # 计算学生课程冲突指标
-    conflict_count, conflict_rate, conflict_students, total_students = compute_student_conflict_with_activities(
+    # 验证课程持续时间是否一致
+    duration_check = {}
+    for _, row in schedule_df.iterrows():
+        course_code = row['Course Code']
+        duration = row['Duration']
+        duration_slots = row['Duration Slots']
+
+        if course_code not in duration_check:
+            duration_check[course_code] = {}
+
+        if duration not in duration_check[course_code]:
+            duration_check[course_code][duration] = set()
+
+        duration_check[course_code][duration].add(duration_slots)
+
+    duration_errors = []
+    for course, durations in duration_check.items():
+        for duration, slots_set in durations.items():
+            if len(slots_set) > 1:
+                duration_errors.append((course, duration, list(slots_set)))
+
+    if duration_errors:
+        print("\n警告: 发现持续时间不一致的课程:")
+        for course, duration, slots in duration_errors:
+            print(f"  课程 {course}, 原始持续时间 {duration}, 解析为不同的时间槽: {slots}")
+    else:
+        print("\n所有课程的持续时间都一致")
+
+    # 计算学生课程冲突指标，返回额外的冲突详情
+    conflict_count, conflict_rate, conflict_students, total_students, conflict_details = compute_student_conflict_with_activities(
         schedule_df, course_students)
 
     print("\n优化指标:")
@@ -1343,7 +1442,44 @@ def simulated_annealing_scheduling(
     print("有冲突的学生数: {} (共{}名学生)".format(conflict_students, total_students))
     print("学生冲突率: {:.2f}%".format(conflict_rate))
 
-    return schedule_df, course_students
+    # 创建冲突信息的DataFrame
+    if conflict_details:
+        conflict_df = pd.DataFrame(conflict_details)
+
+        # 创建ExcelWriter对象，使用已创建的文件
+        with pd.ExcelWriter(output_file, mode='a', engine='openpyxl') as writer:
+            # 将冲突信息写入新的工作表
+            conflict_df.to_excel(writer, sheet_name='课程冲突详情', index=False)
+
+            # 创建持续时间检查工作表
+            if duration_errors:
+                duration_error_data = []
+                for course, duration, slots in duration_errors:
+                    duration_error_data.append({
+                        '课程代码': course,
+                        '原始持续时间': duration,
+                        '解析为时间槽': ', '.join(map(str, slots))
+                    })
+                pd.DataFrame(duration_error_data).to_excel(writer, sheet_name='持续时间检查', index=False)
+
+            # 创建优化指标总结工作表
+            summary_data = {
+                '指标': ['平均教室利用率', '学生课程冲突总数', '有冲突的学生数', '总学生数', '学生冲突率'],
+                '值': [
+                    f"{avg_utilization:.2f}%",
+                    conflict_count,
+                    conflict_students,
+                    total_students,
+                    f"{conflict_rate:.2f}%"
+                ]
+            }
+            pd.DataFrame(summary_data).to_excel(writer, sheet_name='优化指标总结', index=False)
+
+        print(f"冲突详情和优化指标已写入 {output_file}")
+    else:
+        print("没有发现课程冲突")
+
+    return schedule_df, course_students, conflict_details
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="课程排课系统（支持不同活动类型和合并workshop）")
@@ -1365,7 +1501,7 @@ if __name__ == "__main__":
                         help='学生课程冲突权重')
     args = parser.parse_args()
 
-    result_schedule, course_students = simulated_annealing_scheduling(
+    result_schedule, course_students, conflict_details = simulated_annealing_scheduling(
         enrollment_file=args.enrollment_file,
         courses_file=args.courses_file,
         rooms_file=args.rooms_file,
@@ -1376,7 +1512,7 @@ if __name__ == "__main__":
         conflict_weight=100.0  # 显著降低冲突权重，使其成为真正的软约束
     )
 
-    conflict_count, conflict_rate, num_conflict_students, total_students = compute_student_conflict_with_activities(
+    conflict_count, conflict_rate, num_conflict_students, total_students, _ = compute_student_conflict_with_activities(
         result_schedule, course_students)
 
     print("全体学生数:", total_students)
